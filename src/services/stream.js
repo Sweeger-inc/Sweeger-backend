@@ -37,11 +37,13 @@ const createStreamCall = async (roomId, hostId) => {
         members: [{ user_id: hostId, role: 'host' }],
         settings_override: {
           audio: { 
+            enabled: true,
             mic_default_on: false,
             default_device: 'speaker',
             noise_cancellation: { mode: 'disabled' }
           },
           video: { 
+            enabled: true,
             camera_default_on: false,
             target_resolution: {
               width: 1280,
