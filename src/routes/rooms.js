@@ -351,23 +351,31 @@ if (userId) {
 
     // Check if already a participant
     const { data: existing } = await supabase
-      .from('room_participants')
-      .select('id')
-      .eq('room_id', roomId)
-      .eq('user_id', userId)
-      .eq('is_active', true)
-      .single();
+  .from('room_participants')
+  .select('id')
+  .eq('room_id', roomId)
+  .eq('user_id', userId)
+  .single();
 
-    if (!existing) {
-      await supabase
-        .from('room_participants')
-        .insert({
-          room_id: roomId,
-          user_id: userId,
-          guest_name: userId ? null : displayName,
-          is_active: true,
-        });
-    }
+if (existing) {
+  await supabase
+    .from('room_participants')
+    .update({ 
+      is_active: true, 
+      left_at: null, 
+      joined_at: new Date().toISOString() 
+    })
+    .eq('id', existing.id);
+} else {
+  await supabase
+    .from('room_participants')
+    .insert({
+      room_id: roomId,
+      user_id: userId,
+      guest_name: userId ? null : displayName,
+      is_active: true,
+    });
+}
 
     // Calculate adjusted timestamp for sync
     const updatedAt = new Date(room.updated_at).getTime();
