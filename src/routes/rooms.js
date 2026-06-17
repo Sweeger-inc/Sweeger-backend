@@ -139,17 +139,25 @@ router.get('/active', async (req, res) => {
     }
 
     // Shape the response
-    const shaped = rooms.map(room => ({
-      id: room.id,
-      name: room.name,
-      video_id: room.video_id,
-      video_title: room.video_title,
-      video_thumbnail: room.video_thumbnail,
-      is_playing: room.is_playing,
-      created_at: room.created_at,
-      host: room.users,
-      participant_count: room.room_participants[0]?.count || 0,
-    }));
+    const shaped = await Promise.all(rooms.map(async (room) => {
+  const { count: activeCount } = await supabase
+    .from('room_participants')
+    .select('*', { count: 'exact', head: true })
+    .eq('room_id', room.id)
+    .eq('is_active', true);
+
+  return {
+    id: room.id,
+    name: room.name,
+    video_id: room.video_id,
+    video_title: room.video_title,
+    video_thumbnail: room.video_thumbnail,
+    is_playing: room.is_playing,
+    created_at: room.created_at,
+    host: room.users,
+    participant_count: activeCount || 0,
+  };
+}));
 
     return res.status(200).json({ rooms: shaped });
 
