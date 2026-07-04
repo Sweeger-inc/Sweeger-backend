@@ -264,12 +264,20 @@ const { count: activeCount } = await supabase
   .eq('room_id', roomId)
   .eq('is_active', true);
 
+const updatedAt = new Date(room.updated_at).getTime();
+const now = Date.now();
+const elapsed = (now - updatedAt) / 1000;
+const adjustedTime = room.is_playing
+  ? room["current_time"] + elapsed
+  : room["current_time"];
+
 return res.status(200).json({
   room: {
     ...room,
     host_id: room.host_id,
     host: room.users,
     participant_count: activeCount || 0,
+    current_time: adjustedTime,
   }
 });
 
@@ -509,12 +517,13 @@ router.patch('/:roomId/playback', requireAuth, requireHost, async (req, res) => 
     }
 
     const { error } = await supabase
-      .from('rooms')
-      .update({ 
-        is_playing,
-        "current_time": current_time,
-      })
-      .eq('id', roomId);
+  .from('rooms')
+  .update({ 
+    is_playing,
+    "current_time": current_time,
+    updated_at: new Date().toISOString(),
+  })
+  .eq('id', roomId);
 
     if (error) {
       return res.status(500).json({ error: 'Failed to update playback' });
