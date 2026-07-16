@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { searchVideos } = require('../services/youtube');
+const { searchVideos, getLiveVideos } = require('../services/youtube');
 
 // GET /api/search?q=burna boy
 router.get('/', async (req, res) => {
