@@ -99,4 +99,4 @@ const getLiveVideos = async () => {
   return results;
 };
 
-module.exports = { searchVideos };
+module.exports = { searchVideos, getLiveVideos };
