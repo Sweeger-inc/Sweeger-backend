@@ -68,4 +68,35 @@ const searchVideos = async (query) => {
   return results;
 };
 
+const getLiveVideos = async () => {
+  const response = await youtube.search.list({
+    part: 'snippet',
+    type: 'video',
+    eventType: 'live',
+    maxResults: 20,
+    regionCode: 'NG',
+    relevanceLanguage: 'en',
+    videoEmbeddable: 'true',
+    order: 'viewCount',
+  });
+
+  const videoIds = response.data.items.map(item => item.id.videoId).join(',');
+
+  // Fetch video statistics separately to get viewer count
+  const statsResponse = await youtube.videos.list({
+    part: 'statistics,snippet',
+    id: videoIds,
+  });
+
+  const results = statsResponse.data.items.map(item => ({
+    video_id: item.id,
+    title: item.snippet.title,
+    thumbnail: item.snippet.thumbnails.high.url,
+    channel_name: item.snippet.channelTitle,
+    viewer_count: item.statistics.viewCount || '0',
+  }));
+
+  return results;
+};
+
 module.exports = { searchVideos };
