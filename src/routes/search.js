@@ -38,4 +38,23 @@ router.get('/', async (req, res) => {
   }
 });
 
+// GET /api/search/live
+router.get('/live', async (req, res) => {
+  try {
+    const results = await getLiveVideos();
+    return res.status(200).json({
+      count: results.length,
+      results,
+    });
+  } catch (err) {
+    console.error('Live videos error:', err.message);
+    if (err.code === 403) {
+      return res.status(503).json({
+        error: 'Live videos temporarily unavailable. Try again later.',
+      });
+    }
+    return res.status(500).json({ error: 'Failed to fetch live videos' });
+  }
+});
+
 module.exports = router;
