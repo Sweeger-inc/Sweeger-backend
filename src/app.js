@@ -35,6 +35,7 @@ app.use('/api/rooms', require('./routes/rooms'));
 app.use('/api/rooms/:roomId/chat', require('./routes/chat'));
 app.use('/api/webhooks', require('./routes/webhooks'));
 app.use('/api/follows', require('./routes/follows'));
+app.use('/api/poddy', require('./routes/poddy'));
 
 // --- 404 handler ---
 app.use((req, res) => {
