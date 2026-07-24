@@ -288,7 +288,7 @@ return res.status(200).json({
 });
 
 // --------------------------------------------------------
-// POST /api/rooms/:roomId/join
+// POST /api/rooms/:roomId
 // Join a room
 // --------------------------------------------------------
 router.post('/:roomId/join', optionalAuth, async (req, res) => {
@@ -407,6 +407,23 @@ const streamToken = generateStreamToken(streamUserId);
 
 console.log(`✅ ${displayName} joined room ${roomId}`);
 
+// Fire poddy notifications in the background
+try {
+  const { notifyPoddyFriends } = require('./notifications');
+  const { data: userData } = await supabase
+    .from('users')
+    .select('display_name')
+    .eq('id', userId)
+    .single();
+  
+  if (userData) {
+    notifyPoddyFriends(userId, userData.display_name, roomId, room.name);
+  }
+} catch (notifyErr) {
+  console.error('Poddy notify error:', notifyErr.message);
+  // Non-blocking — don't fail the join if notification fails
+}
+    
 return res.status(200).json({
   room: {
     id: room.id,
