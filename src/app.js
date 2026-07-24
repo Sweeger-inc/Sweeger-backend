@@ -38,6 +38,7 @@ app.use('/api/follows', require('./routes/follows'));
 app.use('/api/poddy', require('./routes/poddy'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/watchmate', require('./routes/watchmate'));
+app.use('/api/categories', require('./routes/categories'));
 
 // --- 404 handler ---
 app.use((req, res) => {
