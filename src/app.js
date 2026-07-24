@@ -37,6 +37,7 @@ app.use('/api/webhooks', require('./routes/webhooks'));
 app.use('/api/follows', require('./routes/follows'));
 app.use('/api/poddy', require('./routes/poddy'));
 app.use('/api/subscriptions', require('./routes/subscriptions'));
+app.use('/api/watchmate', require('./routes/watchmate'));
 
 // --- 404 handler ---
 app.use((req, res) => {
