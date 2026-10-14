@@ -5,6 +5,7 @@ const {
 } = require('../services/stream');
 
 const express = require('express');
+const scorezone = require('../services/scorezone');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const supabase = require('../services/supabase');
@@ -122,6 +123,8 @@ router.get('/active', async (req, res) => {
         video_id,
         video_title,
         video_thumbnail,
+        room_type,
+        match_id,
         is_playing,
         is_public,
         created_at,
@@ -156,6 +159,8 @@ router.get('/active', async (req, res) => {
     created_at: room.created_at,
     host: room.users,
     participant_count: activeCount || 0,
+    room_type: room.room_type,
+    match_id: room.match_id,
   };
 }));
 
@@ -209,6 +214,8 @@ router.get('/for-video/:videoId', async (req, res) => {
       created_at: room.created_at,
       host: room.users,
       participant_count: room.room_participants[0]?.count || 0,
+      room_type: room.room_type,
+      match_id: room.match_id,
     }));
 
     return res.status(200).json({ rooms: shaped });
@@ -423,7 +430,21 @@ try {
   console.error('Poddy notify error:', notifyErr.message);
   // Non-blocking — don't fail the join if notification fails
 }
-    
+
+let match = null;
+if (room.room_type === 'match' && room.match_id) {
+  try {
+    const embed = await scorezone.getEmbed(room.match_id, {
+      sport: room.sport || 'football',
+      ...(room.match_meta || {}),
+    });
+    match = { id: room.match_id, sport: room.sport, ...embed };
+  } catch (embedErr) {
+    console.error('Match embed error:', embedErr.message);
+    match = { id: room.match_id, sport: room.sport, embed_url: null, streams: [] };
+  }
+}
+
 return res.status(200).json({
   room: {
     id: room.id,

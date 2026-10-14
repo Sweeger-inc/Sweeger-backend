@@ -31,6 +31,7 @@ app.get('/health', (req, res) => {
 
 // --- Routes ---
 app.use('/api/search', require('./routes/search'));
+app.use('/api/matches', require('./routes/matches'));
 app.use('/api/rooms', require('./routes/rooms'));
 app.use('/api/rooms/:roomId/chat', require('./routes/chat'));
 app.use('/api/webhooks', require('./routes/webhooks'));
