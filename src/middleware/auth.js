@@ -42,6 +42,12 @@ const requireAuth = async (req, res, next) => {
 // -------------------------------------------------------
 const optionalAuth = async (req, res, next) => {
   try {
+    // DEV ONLY - bypass auth with just a userId header
+    if (process.env.NODE_ENV === 'development' && req.headers['x-dev-user-id']) {
+      req.auth = { userId: req.headers['x-dev-user-id'] };
+      return next();
+    }
+
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith('Bearer ')) {

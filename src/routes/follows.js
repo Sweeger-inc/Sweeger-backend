@@ -14,31 +14,49 @@ router.post('/:userId', requireAuth, async (req, res) => {
     }
 
     // Check target user exists
-    const { data: targetUser } = await supabase
+    const { data: targetUser, error: targetUserError } = await supabase
       .from('users')
       .select('id')
       .eq('id', targetUserId)
-      .single();
+      .maybeSingle();
+
+    if (targetUserError) {
+      console.error('Check user error:', targetUserError.message);
+      return res.status(500).json({ error: 'Failed to verify user' });
+    }
 
     if (!targetUser) {
       return res.status(404).json({ error: 'User not found' });
     }
 
     // Check already following
-    const { data: existing } = await supabase
+    const { data: existing, error: existingError } = await supabase
       .from('follows')
       .select('id')
       .eq('follower_id', followerId)
       .eq('following_id', targetUserId)
-      .single();
+      .maybeSingle();
+
+    if (existingError) {
+      console.error('Check follow status error:', existingError.message);
+      return res.status(500).json({ error: 'Failed to check follow status' });
+    }
 
     if (existing) {
       return res.status(400).json({ error: 'You are already following this user' });
     }
 
-    await supabase
+    const { error: insertError } = await supabase
       .from('follows')
       .insert({ follower_id: followerId, following_id: targetUserId });
+
+    if (insertError) {
+      if (insertError.code === '23505') {
+        return res.status(400).json({ error: 'You are already following this user' });
+      }
+      console.error('Follow error:', insertError.message);
+      return res.status(500).json({ error: 'Failed to follow user' });
+    }
 
     return res.status(201).json({ message: 'Followed successfully' });
 
@@ -54,11 +72,16 @@ router.delete('/:userId', requireAuth, async (req, res) => {
     const { userId: targetUserId } = req.params;
     const followerId = req.auth.userId;
 
-    await supabase
+    const { error: deleteError } = await supabase
       .from('follows')
       .delete()
       .eq('follower_id', followerId)
       .eq('following_id', targetUserId);
+
+    if (deleteError) {
+      console.error('Unfollow error:', deleteError.message);
+      return res.status(500).json({ error: 'Failed to unfollow user' });
+    }
 
     return res.status(200).json({ message: 'Unfollowed successfully' });
 
@@ -88,10 +111,10 @@ router.get('/following', requireAuth, async (req, res) => {
 
     if (error) throw error;
 
-    const following = data.map(row => ({
+    const following = (data || []).map(row => ({
       user_id: row.following_id,
-      display_name: row.users.display_name,
-      avatar_url: row.users.avatar_url,
+      display_name: row.users?.display_name || 'User',
+      avatar_url: row.users?.avatar_url || null,
       followed_at: row.created_at,
     }));
 
@@ -123,10 +146,10 @@ router.get('/followers', requireAuth, async (req, res) => {
 
     if (error) throw error;
 
-    const followers = data.map(row => ({
+    const followers = (data || []).map(row => ({
       user_id: row.follower_id,
-      display_name: row.users.display_name,
-      avatar_url: row.users.avatar_url,
+      display_name: row.users?.display_name || 'User',
+      avatar_url: row.users?.avatar_url || null,
       followed_at: row.created_at,
     }));
 
@@ -144,12 +167,17 @@ router.get('/:userId/status', requireAuth, async (req, res) => {
     const { userId: targetUserId } = req.params;
     const followerId = req.auth.userId;
 
-    const { data } = await supabase
+    const { data, error } = await supabase
       .from('follows')
       .select('id')
       .eq('follower_id', followerId)
       .eq('following_id', targetUserId)
-      .single();
+      .maybeSingle();
+
+    if (error) {
+      console.error('Follow status error:', error.message);
+      return res.status(500).json({ error: 'Failed to check follow status' });
+    }
 
     return res.status(200).json({ is_following: !!data });
 

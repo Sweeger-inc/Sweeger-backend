@@ -125,6 +125,8 @@ router.get('/active', async (req, res) => {
         video_thumbnail,
         room_type,
         match_id,
+        sport,
+        match_meta,
         is_playing,
         is_public,
         created_at,
@@ -161,6 +163,8 @@ router.get('/active', async (req, res) => {
     participant_count: activeCount || 0,
     room_type: room.room_type,
     match_id: room.match_id,
+    sport: room.sport || null,
+    match_meta: room.match_meta || null,
   };
 }));
 
@@ -188,6 +192,10 @@ router.get('/for-video/:videoId', async (req, res) => {
         video_id,
         video_title,
         video_thumbnail,
+        room_type,
+        match_id,
+        sport,
+        match_meta,
         is_playing,
         created_at,
         host_id,
@@ -216,6 +224,8 @@ router.get('/for-video/:videoId', async (req, res) => {
       participant_count: room.room_participants[0]?.count || 0,
       room_type: room.room_type,
       match_id: room.match_id,
+      sport: room.sport || null,
+      match_meta: room.match_meta || null,
     }));
 
     return res.status(200).json({ rooms: shaped });
@@ -285,6 +295,8 @@ return res.status(200).json({
     host: room.users,
     participant_count: activeCount || 0,
     current_time: adjustedTime,
+    sport: room.sport || null,
+    match_meta: room.match_meta || null,
   }
 });
 
@@ -451,10 +463,17 @@ return res.status(200).json({
     name: room.name,
     video_id: room.video_id,
     video_title: room.video_title,
+    video_thumbnail: room.video_thumbnail,
     is_playing: room.is_playing,
     current_time: adjustedTime,
+    room_type: room.room_type,
+    match_id: room.match_id || null,
+    sport: room.sport || null,
+    match_meta: room.match_meta || null,
   },
+  match,
   participant: {
+    user_id: userId,
     display_name: displayName,
     is_host: room.host_id === userId,
   },

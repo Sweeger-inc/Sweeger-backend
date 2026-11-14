@@ -180,10 +180,10 @@ router.get('/:roomId/pod', requireAuth, async (req, res) => {
       .eq('pod_id', member.pod_id)
       .eq('is_active', true);
 
-    const shaped = members.map(m => ({
+    const shaped = (members || []).map(m => ({
       user_id: m.user_id,
-      display_name: m.users.display_name,
-      avatar_url: m.users.avatar_url,
+      display_name: m.users?.display_name || 'User',
+      avatar_url: m.users?.avatar_url || null,
       is_admin: m.is_admin,
       joined_at: m.joined_at,
     }));

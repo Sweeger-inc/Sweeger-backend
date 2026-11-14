@@ -7,7 +7,7 @@ const sz = require('../services/scorezone');
 
 // A match room is considered finished after this long (API has no end-time)
 const MATCH_ROOM_TTL_MS = (Number(process.env.MATCH_ROOM_TTL_HOURS) || 6) * 60 * 60 * 1000;
-const MATCH_ID_RE = /^[\w.:-]{3,200}$/;
+const MATCH_ID_RE = /^[\w.:\-@~ %]{3,200}$/;
 
 const handleError = (res, err, label) => {
   if (err instanceof sz.ScoreZoneError) {
@@ -18,24 +18,59 @@ const handleError = (res, err, label) => {
   return res.status(500).json({ error: 'Server error' });
 };
 
-// Attach room info (if any) to events so the UI can show "12 watching"
+// Attach room info and participant count to events so the UI can show "12 watching"
 const withRooms = async (events) => {
-  if (!events.length) return events;
+  if (!events || !events.length) return [];
+  const matchIds = events.map((e) => e.id);
   const { data: rooms } = await supabase
     .from('rooms')
     .select('id, match_id')
     .eq('status', 'active')
-    .in('match_id', events.map((e) => e.id));
+    .in('match_id', matchIds);
 
   const byMatch = new Map((rooms || []).map((r) => [r.match_id, r.id]));
-  return events.map((e) => ({ ...e, room_id: byMatch.get(e.id) || null }));
+  const roomIds = (rooms || []).map((r) => r.id);
+
+  let participantCounts = new Map();
+  if (roomIds.length > 0) {
+    const { data: participants } = await supabase
+      .from('room_participants')
+      .select('room_id')
+      .in('room_id', roomIds)
+      .eq('is_active', true);
+
+    if (participants) {
+      for (const p of participants) {
+        participantCounts.set(p.room_id, (participantCounts.get(p.room_id) || 0) + 1);
+      }
+    }
+  }
+
+  return events.map((e) => {
+    const roomId = byMatch.get(e.id) || null;
+    return {
+      id: e.id,
+      name: e.name,
+      home_team: e.home_team,
+      away_team: e.away_team,
+      league: e.league,
+      status: e.status,
+      is_live: e.is_live,
+      starts_at_label: e.starts_at_label,
+      poster: e.poster || null,
+      room_id: roomId,
+      sport: e.sport,
+      participant_count: roomId ? (participantCounts.get(roomId) || 0) : 0,
+    };
+  });
 };
 
 // GET /api/matches/live?sport=football
 router.get('/live', async (req, res) => {
   try {
     const events = await sz.getLive(req.query.sport || 'football');
-    return res.status(200).json({ count: events.length, matches: await withRooms(events) });
+    const shaped = await withRooms(events);
+    return res.status(200).json({ count: shaped.length, matches: shaped });
   } catch (err) { return handleError(res, err, 'Matches live error'); }
 });
 
@@ -43,7 +78,8 @@ router.get('/live', async (req, res) => {
 router.get('/schedule', async (req, res) => {
   try {
     const events = await sz.getSchedule(req.query.sport || 'football', req.query.skip);
-    return res.status(200).json({ count: events.length, matches: await withRooms(events) });
+    const shaped = await withRooms(events);
+    return res.status(200).json({ count: shaped.length, matches: shaped });
   } catch (err) { return handleError(res, err, 'Matches schedule error'); }
 });
 
@@ -55,8 +91,9 @@ router.get('/schedule', async (req, res) => {
 // --------------------------------------------------------
 router.post('/:matchId/room', requireAuth, async (req, res) => {
   try {
-    const { matchId } = req.params;
-    const { sport = 'football', skip = 0 } = req.body || {};
+    const rawMatchId = req.params.matchId;
+    const matchId = decodeURIComponent(rawMatchId).trim();
+    const { sport = 'football', skip = 0, name, home_team, away_team, league, poster } = req.body || {};
     const userId = req.auth.userId;
 
     if (!MATCH_ID_RE.test(matchId)) {
@@ -89,8 +126,20 @@ router.post('/:matchId/room', requireAuth, async (req, res) => {
       return res.status(200).json({ room_id: existing.id, created: false });
     }
 
-    // 2. Verify the match really exists upstream; metadata comes from ScoreZone, not the client
-    const event = await sz.findEvent(matchId, sport, skip);
+    // 2. Look up match metadata from ScoreZone / fallback, or body
+    let event = await sz.findEvent(matchId, sport, skip);
+    if (!event && (home_team || name)) {
+      event = {
+        id: matchId,
+        name: name || (home_team && away_team ? `${home_team} vs ${away_team}` : matchId),
+        home_team: home_team || 'Home',
+        away_team: away_team || 'Away',
+        league: league || 'Sports',
+        sport: sport || 'football',
+        poster: poster || null,
+      };
+    }
+
     if (!event) return res.status(404).json({ error: 'Match not found' });
 
     // 3. Create it. The unique index makes concurrent creates safe.
@@ -116,7 +165,7 @@ router.post('/:matchId/room', requireAuth, async (req, res) => {
       .single();
 
     if (error) {
-      if (error.code === '23505') {            // someone else won the race
+      if (error.code === '23505') { // someone else won the race
         const { data: winner } = await findActive();
         if (winner) return res.status(200).json({ room_id: winner.id, created: false });
       }
@@ -137,7 +186,8 @@ router.post('/:matchId/room', requireAuth, async (req, res) => {
 // GET /api/matches/:matchId/embed?sport=football&home=..&away=..&league=..
 router.get('/:matchId/embed', async (req, res) => {
   try {
-    const { matchId } = req.params;
+    const rawMatchId = req.params.matchId;
+    const matchId = decodeURIComponent(rawMatchId).trim();
     if (!MATCH_ID_RE.test(matchId)) {
       return res.status(400).json({ error: 'Invalid match id' });
     }
