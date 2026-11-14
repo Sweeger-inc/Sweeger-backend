@@ -4,7 +4,7 @@ require('dotenv').config();
 const client = new StreamClient(
   process.env.STREAM_API_KEY,
   process.env.STREAM_API_SECRET,
-  { timeout: 10000 }
+  { timeout: 3000 }
 );
 
 // --------------------------------------------------------
@@ -91,3 +91,4 @@ const endStreamCall = async (roomId) => {
 };
 
 module.exports = { generateStreamToken, createStreamCall, endStreamCall };
+

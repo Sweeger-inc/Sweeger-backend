@@ -3,10 +3,9 @@ const router = express.Router();
 const supabase = require('../services/supabase');
 const { requireAuth } = require('../middleware/auth');
 const { createStreamCall, endStreamCall } = require('../services/stream');
+const { getBatchViewerCounts, trashRoom, isRoomStale, MATCH_ROOM_TTL_MS } = require('../services/roomCleaner');
 const sz = require('../services/scorezone');
 
-// A match room is considered finished after this long (API has no end-time)
-const MATCH_ROOM_TTL_MS = (Number(process.env.MATCH_ROOM_TTL_HOURS) || 6) * 60 * 60 * 1000;
 const MATCH_ID_RE = /^[\w.:\-@~ %]{3,200}$/;
 
 const handleError = (res, err, label) => {
@@ -18,31 +17,39 @@ const handleError = (res, err, label) => {
   return res.status(500).json({ error: 'Server error' });
 };
 
-// Attach room info and participant count to events so the UI can show "12 watching"
+// Attach room info and participant count to events so the UI can show real viewer counts
 const withRooms = async (events) => {
   if (!events || !events.length) return [];
   const matchIds = events.map((e) => e.id);
-  const { data: rooms } = await supabase
+  const { data: rooms, error } = await supabase
     .from('rooms')
-    .select('id, match_id')
+    .select('id, match_id, created_at, updated_at, room_type')
     .eq('status', 'active')
     .in('match_id', matchIds);
 
-  const byMatch = new Map((rooms || []).map((r) => [r.match_id, r.id]));
-  const roomIds = (rooms || []).map((r) => r.id);
+  if (error || !rooms || rooms.length === 0) {
+    return events.map((e) => ({
+      ...e,
+      room_id: null,
+      participant_count: 0,
+    }));
+  }
 
-  let participantCounts = new Map();
-  if (roomIds.length > 0) {
-    const { data: participants } = await supabase
-      .from('room_participants')
-      .select('room_id')
-      .in('room_id', roomIds)
-      .eq('is_active', true);
+  const roomIds = rooms.map((r) => r.id);
+  const viewerCounts = await getBatchViewerCounts(roomIds);
 
-    if (participants) {
-      for (const p of participants) {
-        participantCounts.set(p.room_id, (participantCounts.get(p.room_id) || 0) + 1);
-      }
+  const byMatch = new Map();
+  const participantCounts = new Map();
+
+  for (const r of rooms) {
+    const { count } = viewerCounts.get(r.id) || { count: 0 };
+    const { isStale, reason } = isRoomStale(r, count);
+
+    if (isStale) {
+      trashRoom(r.id, reason).catch((err) => console.error('Error trashing stale match room:', err));
+    } else {
+      byMatch.set(r.match_id, r.id);
+      participantCounts.set(r.id, count);
     }
   }
 
@@ -111,14 +118,8 @@ router.post('/:matchId/room', requireAuth, async (req, res) => {
     let { data: existing } = await findActive();
 
     if (existing && Date.now() - new Date(existing.created_at).getTime() > MATCH_ROOM_TTL_MS) {
-      // Stale room from an old match — retire it and start fresh
-      await supabase.from('rooms')
-        .update({ status: 'ended', ended_at: new Date().toISOString(), is_playing: false })
-        .eq('id', existing.id);
-      await supabase.from('room_participants')
-        .update({ is_active: false, left_at: new Date().toISOString() })
-        .eq('room_id', existing.id).eq('is_active', true);
-      await endStreamCall(existing.id);
+      // Stale room from an old match — trash it and start fresh
+      await trashRoom(existing.id, 'match_room_ttl_expired');
       existing = null;
     }
 

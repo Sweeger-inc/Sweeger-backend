@@ -57,8 +57,10 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 5000;
 if (require.main === module) {
+  const { startRoomCleaner } = require('./services/roomCleaner');
   app.listen(PORT, () => {
     console.log(`🚀 Sweeger backend running on port ${PORT}`);
+    startRoomCleaner(30000);
   });
 }
 

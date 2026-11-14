@@ -4,6 +4,17 @@ const {
   endStreamCall 
 } = require('../services/stream');
 
+const {
+  calculateDistinctViewers,
+  getBatchViewerCounts,
+  trashRoom,
+  isRoomStale,
+  filterAndCleanStaleRooms,
+  cleanAllStaleRooms,
+  recordHeartbeat,
+  removePresence,
+} = require('../services/roomCleaner');
+
 const express = require('express');
 const scorezone = require('../services/scorezone');
 const router = express.Router();
@@ -130,9 +141,9 @@ router.get('/active', async (req, res) => {
         is_playing,
         is_public,
         created_at,
+        updated_at,
         host_id,
-        users!rooms_host_id_fkey (display_name, avatar_url),
-        room_participants (count)
+        users!rooms_host_id_fkey (display_name, avatar_url)
       `)
       .eq('status', 'active')
       .eq('is_public', true)
@@ -143,30 +154,24 @@ router.get('/active', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch rooms' });
     }
 
-    // Shape the response
-    const shaped = await Promise.all(rooms.map(async (room) => {
-  const { count: activeCount } = await supabase
-    .from('room_participants')
-    .select('*', { count: 'exact', head: true })
-    .eq('room_id', room.id)
-    .eq('is_active', true);
+    // Filter out and immediately trash stale rooms, computing accurate distinct viewer counts
+    const cleanRooms = await filterAndCleanStaleRooms(rooms || []);
 
-  return {
-    id: room.id,
-    name: room.name,
-    video_id: room.video_id,
-    video_title: room.video_title,
-    video_thumbnail: room.video_thumbnail,
-    is_playing: room.is_playing,
-    created_at: room.created_at,
-    host: room.users,
-    participant_count: activeCount || 0,
-    room_type: room.room_type,
-    match_id: room.match_id,
-    sport: room.sport || null,
-    match_meta: room.match_meta || null,
-  };
-}));
+    const shaped = cleanRooms.map((room) => ({
+      id: room.id,
+      name: room.name,
+      video_id: room.video_id,
+      video_title: room.video_title,
+      video_thumbnail: room.video_thumbnail,
+      is_playing: room.is_playing,
+      created_at: room.created_at,
+      host: room.users,
+      participant_count: room.participant_count || 0,
+      room_type: room.room_type,
+      match_id: room.match_id,
+      sport: room.sport || null,
+      match_meta: room.match_meta || null,
+    }));
 
     return res.status(200).json({ rooms: shaped });
 
@@ -198,9 +203,9 @@ router.get('/for-video/:videoId', async (req, res) => {
         match_meta,
         is_playing,
         created_at,
+        updated_at,
         host_id,
-        users!rooms_host_id_fkey (display_name, avatar_url),
-        room_participants (count)
+        users!rooms_host_id_fkey (display_name, avatar_url)
       `)
       .eq('status', 'active')
       .eq('is_public', true)
@@ -212,7 +217,10 @@ router.get('/for-video/:videoId', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch rooms' });
     }
 
-    const shaped = rooms.map(room => ({
+    // Filter out and immediately trash stale rooms, computing accurate distinct viewer counts
+    const cleanRooms = await filterAndCleanStaleRooms(rooms || []);
+
+    const shaped = cleanRooms.map((room) => ({
       id: room.id,
       name: room.name,
       video_id: room.video_id,
@@ -221,7 +229,7 @@ router.get('/for-video/:videoId', async (req, res) => {
       is_playing: room.is_playing,
       created_at: room.created_at,
       host: room.users,
-      participant_count: room.room_participants[0]?.count || 0,
+      participant_count: room.participant_count || 0,
       room_type: room.room_type,
       match_id: room.match_id,
       sport: room.sport || null,
@@ -249,8 +257,7 @@ router.get('/:roomId', optionalAuth, async (req, res) => {
       .from('rooms')
       .select(`
         *,
-        users!rooms_host_id_fkey (display_name, avatar_url),
-        room_participants (count)
+        users!rooms_host_id_fkey (display_name, avatar_url)
       `)
       .eq('id', roomId)
       .single();
@@ -274,31 +281,43 @@ router.get('/:roomId', optionalAuth, async (req, res) => {
       }
     }
 
-    // Get accurate active count
-const { count: activeCount } = await supabase
-  .from('room_participants')
-  .select('*', { count: 'exact', head: true })
-  .eq('room_id', roomId)
-  .eq('is_active', true);
+    // Get accurate distinct active count
+    const { data: activeParticipants } = await supabase
+      .from('room_participants')
+      .select('id, user_id, guest_name, joined_at, is_active')
+      .eq('room_id', roomId)
+      .eq('is_active', true);
 
-const updatedAt = new Date(room.updated_at).getTime();
-const now = Date.now();
-const elapsed = (now - updatedAt) / 1000;
-const adjustedTime = room.is_playing
-  ? room["current_time"] + elapsed
-  : room["current_time"];
+    const { count: activeCount } = calculateDistinctViewers(activeParticipants || []);
 
-return res.status(200).json({
-  room: {
-    ...room,
-    host_id: room.host_id,
-    host: room.users,
-    participant_count: activeCount || 0,
-    current_time: adjustedTime,
-    sport: room.sport || null,
-    match_meta: room.match_meta || null,
-  }
-});
+    // Check if room is stale
+    const { isStale, reason } = isRoomStale(room, activeCount);
+    if (isStale) {
+      await trashRoom(roomId, reason);
+      return res.status(410).json({ 
+        error: 'This room has ended',
+        video_title: room.video_title,
+      });
+    }
+
+    const updatedAt = new Date(room.updated_at || room.created_at).getTime();
+    const now = Date.now();
+    const elapsed = (now - updatedAt) / 1000;
+    const adjustedTime = room.is_playing
+      ? room["current_time"] + elapsed
+      : room["current_time"];
+
+    return res.status(200).json({
+      room: {
+        ...room,
+        host_id: room.host_id,
+        host: room.users,
+        participant_count: activeCount || 0,
+        current_time: adjustedTime,
+        sport: room.sport || null,
+        match_meta: room.match_meta || null,
+      }
+    });
 
   } catch (err) {
     console.error('Get room error:', err.message);
@@ -307,13 +326,13 @@ return res.status(200).json({
 });
 
 // --------------------------------------------------------
-// POST /api/rooms/:roomId
+// POST /api/rooms/:roomId/join
 // Join a room
 // --------------------------------------------------------
 router.post('/:roomId/join', optionalAuth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const { invite, guest_name } = req.body || {};
+    const { invite, guest_name, guest_id: clientGuestId } = req.body || {};
     const userId = req.auth?.userId || null;
 
     // Fetch room
@@ -338,82 +357,137 @@ router.post('/:roomId/join', optionalAuth, async (req, res) => {
       }
     }
 
-    // Deactivate any existing session for this user first
-if (userId) {
-  await supabase
-    .from('room_participants')
-    .update({ is_active: false, left_at: new Date().toISOString() })
-    .eq('room_id', roomId)
-    .eq('user_id', userId)
-    .eq('is_active', true);
-} else {
-  // For guests clean up old sessions older than 10 minutes
-  await supabase
-    .from('room_participants')
-    .update({ is_active: false, left_at: new Date().toISOString() })
-    .eq('room_id', roomId)
-    .is('user_id', null)
-    .eq('is_active', true)
-    .lt('joined_at', new Date(Date.now() - 10 * 60 * 1000).toISOString());
-}
+    // Get display name
+    let displayName = 'Guest';
+    if (userId) {
+      const { data: userRecord } = await supabase
+        .from('users')
+        .select('display_name')
+        .eq('id', userId)
+        .single();
+      displayName = userRecord?.display_name || guest_name || 'User';
+    } else if (guest_name) {
+      displayName = guest_name.trim();
+    }
 
-// Check capacity — max 12 participants
-const { count } = await supabase
-  .from('room_participants')
-  .select('*', { count: 'exact', head: true })
-  .eq('room_id', roomId)
-  .eq('is_active', true);
+    // Check capacity — max 12 participants (calculate real distinct viewers)
+    const { data: currentParticipants } = await supabase
+      .from('room_participants')
+      .select('id, user_id, guest_name, is_active')
+      .eq('room_id', roomId)
+      .eq('is_active', true);
 
-if (count >= 12) {
-  return res.status(403).json({ 
-    error: 'room_full',
-    message: 'This room is full. Create your own room for this video.'
-  });
-}
+    const { count: currentCount, distinctUsers, distinctGuests } = calculateDistinctViewers(currentParticipants || []);
+    
+    // Check if the current user/guest is already counted among the active viewers
+    const isAlreadyActive = userId 
+      ? distinctUsers.has(userId) 
+      : (displayName && distinctGuests.has(displayName.toLowerCase()));
 
-   // Get display name
-let displayName = 'Guest';
-if (userId) {
-  const { data: userRecord } = await supabase
-    .from('users')
-    .select('display_name')
-    .eq('id', userId)
-    .single();
-  displayName = userRecord?.display_name || guest_name || 'User';
-} else if (guest_name) {
-  displayName = guest_name;
-}
+    if (currentCount >= 12 && !isAlreadyActive) {
+      return res.status(403).json({ 
+        error: 'room_full',
+        message: 'This room is full. Create your own room for this video.'
+      });
+    }
 
-    // Check if already a participant
-    const { data: existing } = await supabase
-  .from('room_participants')
-  .select('id')
-  .eq('room_id', roomId)
-  .eq('user_id', userId)
-  .single();
+    // Stable guest ID for voice/stream & tracking
+    const effectiveGuestId = clientGuestId || (userId ? null : `guest_${uuidv4().slice(0, 8)}`);
 
-if (existing) {
-  await supabase
-    .from('room_participants')
-    .update({ 
-      is_active: true, 
-      left_at: null, 
-      joined_at: new Date().toISOString() 
-    })
-    .eq('id', existing.id);
-} else {
-  await supabase
-    .from('room_participants')
-    .insert({
-      room_id: roomId,
-      user_id: userId,
-      guest_name: userId ? null : displayName,
-      is_active: true,
-    });
-}
+    // Deduplicate / Activate participant:
+    if (userId) {
+      // Deactivate any active sessions in other rooms for this user
+      await supabase
+        .from('room_participants')
+        .update({ is_active: false, left_at: new Date().toISOString() })
+        .eq('user_id', userId)
+        .neq('room_id', roomId)
+        .eq('is_active', true);
+
+      // Check existing rows in this room
+      const { data: existingRows } = await supabase
+        .from('room_participants')
+        .select('id')
+        .eq('room_id', roomId)
+        .eq('user_id', userId);
+
+      if (existingRows && existingRows.length > 0) {
+        // Keep the first row, update it to active
+        const primaryId = existingRows[0].id;
+        await supabase
+          .from('room_participants')
+          .update({ 
+            is_active: true, 
+            left_at: null, 
+            joined_at: new Date().toISOString() 
+          })
+          .eq('id', primaryId);
+
+        // Deactivate any duplicate rows for this user in this room
+        if (existingRows.length > 1) {
+          const duplicateIds = existingRows.slice(1).map(r => r.id);
+          await supabase
+            .from('room_participants')
+            .update({ is_active: false, left_at: new Date().toISOString() })
+            .in('id', duplicateIds);
+        }
+      } else {
+        await supabase
+          .from('room_participants')
+          .insert({
+            room_id: roomId,
+            user_id: userId,
+            guest_name: null,
+            is_active: true,
+            joined_at: new Date().toISOString(),
+          });
+      }
+    } else {
+      // Guest participant: match by guest_name in this room
+      const { data: existingGuests } = await supabase
+        .from('room_participants')
+        .select('id')
+        .eq('room_id', roomId)
+        .is('user_id', null)
+        .eq('guest_name', displayName);
+
+      if (existingGuests && existingGuests.length > 0) {
+        const primaryId = existingGuests[0].id;
+        await supabase
+          .from('room_participants')
+          .update({
+            is_active: true,
+            left_at: null,
+            joined_at: new Date().toISOString()
+          })
+          .eq('id', primaryId);
+
+        if (existingGuests.length > 1) {
+          const duplicateIds = existingGuests.slice(1).map(r => r.id);
+          await supabase
+            .from('room_participants')
+            .update({ is_active: false, left_at: new Date().toISOString() })
+            .in('id', duplicateIds);
+        }
+      } else {
+        await supabase
+          .from('room_participants')
+          .insert({
+            room_id: roomId,
+            user_id: null,
+            guest_name: displayName,
+            is_active: true,
+            joined_at: new Date().toISOString(),
+          });
+      }
+    }
+
+    // Record presence heartbeat
+    const presenceKey = userId || effectiveGuestId || displayName;
+    recordHeartbeat(roomId, presenceKey);
 
     // Calculate adjusted timestamp for sync
-    const updatedAt = new Date(room.updated_at).getTime();
+    const updatedAt = new Date(room.updated_at || room.created_at).getTime();
     const now = Date.now();
     const elapsed = (now - updatedAt) / 1000;
     const adjustedTime = room.is_playing 
@@ -421,75 +495,76 @@ if (existing) {
       : room["current_time"];
 
     // Generate Stream token for voice/video
-const streamUserId = userId || `guest_${Date.now()}`;
-const streamToken = generateStreamToken(streamUserId);
+    const streamUserId = userId || effectiveGuestId || `guest_${Date.now()}`;
+    const streamToken = generateStreamToken(streamUserId);
 
-console.log(`✅ ${displayName} joined room ${roomId}`);
+    console.log(`✅ ${displayName} joined room ${roomId}`);
 
-// Fire poddy notifications in the background
-try {
-  const { notifyPoddyFriends } = require('./notifications');
-  const { data: userData } = await supabase
-    .from('users')
-    .select('display_name')
-    .eq('id', userId)
-    .single();
-  
-  if (userData) {
-    notifyPoddyFriends(userId, userData.display_name, roomId, room.name);
-  }
-} catch (notifyErr) {
-  console.error('Poddy notify error:', notifyErr.message);
-  // Non-blocking — don't fail the join if notification fails
-}
-
-let match = null;
-if (room.room_type === 'match' && room.match_id) {
-  try {
-    const embed = await scorezone.getEmbed(room.match_id, {
-      sport: room.sport || 'football',
-      ...(room.match_meta || {}),
-    });
-    match = { id: room.match_id, sport: room.sport, ...embed };
-  } catch (embedErr) {
-    console.error('Match embed error:', embedErr.message);
-    match = { id: room.match_id, sport: room.sport, embed_url: null, streams: [] };
-  }
-}
-
-return res.status(200).json({
-  room: {
-    id: room.id,
-    name: room.name,
-    video_id: room.video_id,
-    video_title: room.video_title,
-    video_thumbnail: room.video_thumbnail,
-    is_playing: room.is_playing,
-    current_time: adjustedTime,
-    room_type: room.room_type,
-    match_id: room.match_id || null,
-    sport: room.sport || null,
-    match_meta: room.match_meta || null,
-  },
-  match,
-  participant: {
-    user_id: userId,
-    display_name: displayName,
-    is_host: room.host_id === userId,
-  },
-  stream: {
-    token: streamToken,
-    api_key: process.env.STREAM_API_KEY,
-    call_id: roomId,
-    user_id: streamUserId,
-    // Tell frontend what features are available
-    features: {
-      screensharing: true,
-      voice: true,
-      video: true,
+    // Fire poddy notifications in the background
+    if (userId) {
+      try {
+        const { notifyPoddyFriends } = require('./notifications');
+        const { data: userData } = await supabase
+          .from('users')
+          .select('display_name')
+          .eq('id', userId)
+          .single();
+        
+        if (userData) {
+          notifyPoddyFriends(userId, userData.display_name, roomId, room.name);
+        }
+      } catch (notifyErr) {
+        console.error('Poddy notify error:', notifyErr.message);
+      }
     }
-  }
-});
+
+    let match = null;
+    if (room.room_type === 'match' && room.match_id) {
+      try {
+        const embed = await scorezone.getEmbed(room.match_id, {
+          sport: room.sport || 'football',
+          ...(room.match_meta || {}),
+        });
+        match = { id: room.match_id, sport: room.sport, ...embed };
+      } catch (embedErr) {
+        console.error('Match embed error:', embedErr.message);
+        match = { id: room.match_id, sport: room.sport, embed_url: null, streams: [] };
+      }
+    }
+
+    return res.status(200).json({
+      room: {
+        id: room.id,
+        name: room.name,
+        video_id: room.video_id,
+        video_title: room.video_title,
+        video_thumbnail: room.video_thumbnail,
+        is_playing: room.is_playing,
+        current_time: adjustedTime,
+        room_type: room.room_type,
+        match_id: room.match_id || null,
+        sport: room.sport || null,
+        match_meta: room.match_meta || null,
+      },
+      match,
+      participant: {
+        user_id: userId,
+        guest_id: effectiveGuestId,
+        display_name: displayName,
+        is_host: room.host_id === userId,
+      },
+      stream: {
+        token: streamToken,
+        api_key: process.env.STREAM_API_KEY,
+        call_id: roomId,
+        user_id: streamUserId,
+        features: {
+          screensharing: true,
+          voice: true,
+          video: true,
+        }
+      }
+    });
 
   } catch (err) {
     console.error('Join room error:', err.message);
@@ -505,56 +580,78 @@ router.post('/:roomId/leave', optionalAuth, async (req, res) => {
   try {
     const { roomId } = req.params;
     const userId = req.auth?.userId || null;
+    const { guest_name, guest_id } = req.body || {};
 
-    // Mark participant as inactive
-    await supabase
-      .from('room_participants')
-      .update({ 
-        is_active: false,
-        left_at: new Date().toISOString()
-      })
-      .eq('room_id', roomId)
-      .eq('user_id', userId);
+    // Respond immediately — don't block the client on cleanup work
+    res.status(200).json({ message: 'Left room successfully' });
 
-    // Check if leaver was the host
-    const { data: room } = await supabase
-      .from('rooms')
-      .select('host_id')
-      .eq('id', roomId)
-      .single();
+    // Run all leave logic in background, non-blocking
+    setImmediate(async () => {
+      try {
+        const leftAt = new Date().toISOString();
 
-    if (room && room.host_id === userId) {
-      // Find next participant to promote
-      const { data: nextParticipant } = await supabase
-        .from('room_participants')
-        .select('user_id')
-        .eq('room_id', roomId)
-        .eq('is_active', true)
-        .neq('user_id', userId)
-        .order('joined_at', { ascending: true })
-        .limit(1)
-        .single();
+        // 1. Deactivate leaving participant first
+        if (userId) {
+          await supabase
+            .from('room_participants')
+            .update({ is_active: false, left_at: leftAt })
+            .eq('room_id', roomId)
+            .eq('user_id', userId);
+          removePresence(roomId, userId);
+        } else if (guest_name) {
+          await supabase
+            .from('room_participants')
+            .update({ is_active: false, left_at: leftAt })
+            .eq('room_id', roomId)
+            .is('user_id', null)
+            .eq('guest_name', guest_name.trim());
+          removePresence(roomId, guest_id || guest_name);
+        }
 
-      if (nextParticipant && nextParticipant.user_id) {
-        // Promote next participant to host
-        await supabase
-          .from('rooms')
-          .update({ host_id: nextParticipant.user_id })
-          .eq('id', roomId);
+        // 2. Fetch room status and remaining participants
+        const [{ data: room }, { data: rawParts }] = await Promise.all([
+          supabase.from('rooms').select('host_id, status').eq('id', roomId).single(),
+          supabase
+            .from('room_participants')
+            .select('id, user_id, joined_at, is_active, guest_name')
+            .eq('room_id', roomId)
+            .eq('is_active', true)
+            .order('joined_at', { ascending: true }),
+        ]);
 
-        console.log(`👑 Host promoted: ${nextParticipant.user_id} in room ${roomId}`);
-      } else {
-        // No participants left — schedule room end
-        console.log(`🏚️ No participants left in room ${roomId} — will auto-end`);
+        if (!room || room.status === 'ended') return;
+
+        // In-memory safeguard: ensure the leaving participant is excluded even if DB replication has slight delay
+        const remainingParts = (rawParts || []).filter(p => {
+          if (userId && p.user_id === userId) return false;
+          if (!userId && guest_name && !p.user_id && p.guest_name?.trim().toLowerCase() === guest_name.trim().toLowerCase()) return false;
+          return true;
+        });
+
+        const { count: remainingCount } = calculateDistinctViewers(remainingParts);
+
+        if (remainingCount === 0) {
+          await trashRoom(roomId, 'all_participants_left');
+          console.log(`🗑️ Room ${roomId} trashed — all participants left`);
+        } else if (room.host_id === userId) {
+          const nextUser = (remainingParts || []).find(p => p.user_id && p.user_id !== userId);
+          if (nextUser?.user_id) {
+            await supabase.from('rooms').update({ host_id: nextUser.user_id }).eq('id', roomId);
+            console.log(`👑 Host promoted: ${nextUser.user_id} in room ${roomId}`);
+          } else {
+            await trashRoom(roomId, 'host_left_no_eligible_host');
+            console.log(`🗑️ Room ${roomId} trashed — host left with no eligible successor`);
+          }
+        }
+        console.log(`✅ ${userId || guest_name || 'Guest'} left room ${roomId}`);
+      } catch (bgErr) {
+        console.error('Leave background error:', bgErr.message);
       }
-    }
-
-    console.log(`✅ User ${userId} left room ${roomId}`);
-    return res.status(200).json({ message: 'Left room successfully' });
+    });
 
   } catch (err) {
     console.error('Leave room error:', err.message);
-    return res.status(500).json({ error: 'Server error' });
+    if (!res.headersSent) res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -667,8 +764,99 @@ router.post('/:roomId/invite/regenerate', requireAuth, requireHost, async (req, 
 });
 
 // --------------------------------------------------------
+// POST /api/rooms/:roomId/heartbeat
+// Heartbeat to keep participant and room active
+// --------------------------------------------------------
+router.post('/:roomId/heartbeat', optionalAuth, async (req, res) => {
+  try {
+    const { roomId } = req.params;
+    const userId = req.auth?.userId || null;
+    const { guest_name, guest_id } = req.body || {};
+
+    const { data: room, error: roomError } = await supabase
+      .from('rooms')
+      .select('id, status')
+      .eq('id', roomId)
+      .single();
+
+    if (roomError || !room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    if (room.status === 'ended') {
+      return res.status(410).json({ error: 'This room has ended' });
+    }
+
+    const presenceKey = userId || guest_id || guest_name;
+    if (presenceKey) {
+      recordHeartbeat(roomId, presenceKey);
+    }
+
+    const nowIso = new Date().toISOString();
+
+    // Refresh participant active status in DB
+    if (userId) {
+      await supabase
+        .from('room_participants')
+        .update({ is_active: true, joined_at: nowIso })
+        .eq('room_id', roomId)
+        .eq('user_id', userId);
+    } else if (guest_name) {
+      await supabase
+        .from('room_participants')
+        .update({ is_active: true, joined_at: nowIso })
+        .eq('room_id', roomId)
+        .is('user_id', null)
+        .eq('guest_name', guest_name.trim());
+    }
+
+    // Touch room updated_at
+    await supabase
+      .from('rooms')
+      .update({ updated_at: nowIso })
+      .eq('id', roomId);
+
+    // Get current distinct active count
+    const { data: activeParts } = await supabase
+      .from('room_participants')
+      .select('id, user_id, guest_name, is_active')
+      .eq('room_id', roomId)
+      .eq('is_active', true);
+
+    const { count } = calculateDistinctViewers(activeParts || []);
+
+    return res.status(200).json({
+      status: 'ok',
+      participant_count: count,
+      timestamp: nowIso,
+    });
+  } catch (err) {
+    console.error('Heartbeat error:', err.message);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// --------------------------------------------------------
+// POST /api/rooms/cleanup
+// Trigger manual cleanup of any stale rooms
+// --------------------------------------------------------
+router.post('/cleanup', async (req, res) => {
+  try {
+    const result = await cleanAllStaleRooms();
+    return res.status(200).json({
+      message: 'Cleanup completed successfully',
+      ...result,
+      timestamp: new Date().toISOString(),
+    });
+  } catch (err) {
+    console.error('Manual cleanup error:', err.message);
+    return res.status(500).json({ error: 'Failed to run cleanup' });
+  }
+});
+
+// --------------------------------------------------------
 // GET /api/rooms/:roomId/participants
-// Get all active participants in a room
+// Get all active participants in a room (deduplicated)
 // --------------------------------------------------------
 router.get('/:roomId/participants', async (req, res) => {
   try {
@@ -692,7 +880,10 @@ router.get('/:roomId/participants', async (req, res) => {
       return res.status(500).json({ error: 'Failed to fetch participants' });
     }
 
-    const shaped = participants.map(p => ({
+    // Deduplicate distinct active participants so users/guests are never duplicated
+    const { participants: deduped } = calculateDistinctViewers(participants || []);
+
+    const shaped = deduped.map(p => ({
       id: p.id,
       user_id: p.user_id,
       display_name: p.users?.display_name || p.guest_name || 'Guest',
@@ -701,7 +892,7 @@ router.get('/:roomId/participants', async (req, res) => {
       is_guest: !p.user_id,
     }));
 
-    return res.status(200).json({ participants: shaped });
+    return res.status(200).json({ participants: shaped, count: shaped.length });
 
   } catch (err) {
     console.error('Get participants error:', err.message);
