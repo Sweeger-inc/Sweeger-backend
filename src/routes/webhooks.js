@@ -97,4 +97,90 @@ try {
   }
 });
 
+// --------------------------------------------------------
+// POST /api/webhooks/paystack — handle Paystack payment events
+// --------------------------------------------------------
+router.post('/paystack', async (req, res) => {
+  console.log('📩 Paystack webhook received');
+
+  const paystack = require('../services/paystack');
+  const signature = req.headers['x-paystack-signature'];
+
+  // Verify HMAC-SHA512 webhook signature
+  const isVerified = paystack.verifyWebhookSignature(signature, req.body);
+  if (!isVerified) {
+    console.warn('⚠️ Invalid Paystack webhook signature');
+    return res.status(401).json({ error: 'Invalid Paystack webhook signature' });
+  }
+
+  let event;
+  try {
+    const rawString = Buffer.isBuffer(req.body)
+      ? req.body.toString('utf8')
+      : JSON.stringify(req.body);
+    event = JSON.parse(rawString);
+  } catch (err) {
+    console.error('Failed to parse Paystack webhook payload:', err.message);
+    return res.status(400).json({ error: 'Invalid JSON payload' });
+  }
+
+  const { event: eventType, data } = event;
+  console.log(`Paystack event: ${eventType}`);
+
+  try {
+    if (eventType === 'charge.success') {
+      const userId = data.metadata?.user_id;
+
+      if (userId) {
+        console.log(`Activating subscription for user: ${userId} via Paystack webhook`);
+        const subscriptionStart = new Date(data.paid_at || Date.now());
+        const subscriptionEnd = new Date(subscriptionStart);
+        subscriptionEnd.setDate(subscriptionEnd.getDate() + 30);
+
+        await supabase
+          .from('subscriptions')
+          .upsert({
+            user_id: userId,
+            is_premium: true,
+            status: 'active',
+            subscription_start: subscriptionStart.toISOString(),
+            subscription_end: subscriptionEnd.toISOString(),
+            paystack_customer_id: data.customer?.customer_code || null,
+            paystack_subscription_code: data.reference,
+            updated_at: new Date().toISOString(),
+          }, { onConflict: 'user_id' });
+
+        console.log(`✅ Subscription activated for ${userId}`);
+      }
+    }
+
+    if (eventType === 'subscription.disable' || eventType === 'subscription.not_renew') {
+      const subCode = data.subscription_code;
+      const customerCode = data.customer?.customer_code;
+
+      if (subCode || customerCode) {
+        let query = supabase.from('subscriptions').update({
+          is_premium: false,
+          status: 'cancelled',
+          updated_at: new Date().toISOString(),
+        });
+
+        if (subCode) {
+          query = query.eq('paystack_subscription_code', subCode);
+        } else {
+          query = query.eq('paystack_customer_id', customerCode);
+        }
+
+        await query;
+        console.log(`🛑 Subscription disabled for Paystack code: ${subCode || customerCode}`);
+      }
+    }
+
+    return res.status(200).json({ received: true });
+  } catch (err) {
+    console.error('Paystack webhook processing error:', err.message);
+    return res.status(500).json({ error: 'Webhook processing failed' });
+  }
+});
+
 module.exports = router;
