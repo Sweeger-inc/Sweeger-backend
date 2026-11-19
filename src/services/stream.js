@@ -1,17 +1,30 @@
 const { StreamClient } = require('@stream-io/node-sdk');
 require('dotenv').config();
 
-const client = new StreamClient(
-  process.env.STREAM_API_KEY,
-  process.env.STREAM_API_SECRET,
-  { timeout: 3000 }
-);
+const hasStreamConfig =
+  Boolean(process.env.STREAM_API_KEY) && Boolean(process.env.STREAM_API_SECRET);
+
+let client = null;
+if (hasStreamConfig) {
+  client = new StreamClient(
+    process.env.STREAM_API_KEY,
+    process.env.STREAM_API_SECRET,
+    { timeout: 3000 }
+  );
+} else {
+  console.warn(
+    '[AI Studio] STREAM_API_KEY or STREAM_API_SECRET not configured — using Stream stub'
+  );
+}
 
 // --------------------------------------------------------
 // Generate a Stream token for a user joining a room
 // This token gives them access to Stream's voice/video
 // --------------------------------------------------------
 const generateStreamToken = (userId) => {
+  if (!client) {
+    return `stub-stream-token-${userId}`;
+  }
   try {
     // Stream token never expires during development
     const token = client.generateUserToken({ user_id: userId });
@@ -28,21 +41,24 @@ const generateStreamToken = (userId) => {
 // is created — ties our room ID to a Stream call ID
 // --------------------------------------------------------
 const createStreamCall = async (roomId, hostId) => {
+  if (!client) {
+    return { id: roomId, type: 'default', stub: true };
+  }
   try {
     const call = client.video.call('default', roomId);
-    
+
     await call.getOrCreate({
       data: {
         created_by_id: hostId,
         members: [{ user_id: hostId, role: 'host' }],
         settings_override: {
-          audio: { 
+          audio: {
             enabled: true,
             mic_default_on: false,
             default_device: 'speaker',
             noise_cancellation: { mode: 'disabled' }
           },
-          video: { 
+          video: {
             enabled: true,
             camera_default_on: false,
             target_resolution: {
@@ -79,6 +95,9 @@ const createStreamCall = async (roomId, hostId) => {
 // End a Stream call when the WatchTogether room ends
 // --------------------------------------------------------
 const endStreamCall = async (roomId) => {
+  if (!client) {
+    return;
+  }
   try {
     const call = client.video.call('default', roomId);
     await call.end();
@@ -91,4 +110,3 @@ const endStreamCall = async (roomId) => {
 };
 
 module.exports = { generateStreamToken, createStreamCall, endStreamCall };
-

@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const { Webhook } = require('svix');
 const supabase = require('../services/supabase');
+const subscriptionConfig = require('../config/subscription');
+const walletService = require('../services/wallet');
 
 router.post('/clerk', async (req, res) => {
   console.log('📩 Clerk webhook received');
@@ -14,7 +16,6 @@ router.post('/clerk', async (req, res) => {
     return res.status(500).json({ error: 'Webhook secret not configured' });
   }
 
-  // Get the headers Clerk sends for verification
   const svixId = req.headers['svix-id'];
   const svixTimestamp = req.headers['svix-timestamp'];
   const svixSignature = req.headers['svix-signature'];
@@ -23,34 +24,37 @@ router.post('/clerk', async (req, res) => {
     return res.status(400).json({ error: 'Missing svix headers' });
   }
 
-  // Verify signature
   let event;
-try {
-  // Convert Buffer to string then parse as JSON
-  const payload = Buffer.isBuffer(req.body) 
-    ? req.body.toString('utf8') 
-    : JSON.stringify(req.body);
-    
-  event = JSON.parse(payload);
-  console.log('Event type received:', event.type);
-} catch (err) {
-  console.error('Failed to parse webhook body:', err.message);
-  return res.status(400).json({ error: 'Invalid webhook body' });
-}
+  try {
+    const payload = Buffer.isBuffer(req.body)
+      ? req.body.toString('utf8')
+      : JSON.stringify(req.body);
 
-  // --- 2. Handle the event ---
+    const wh = new Webhook(secret);
+    event = wh.verify(payload, {
+      'svix-id': svixId,
+      'svix-timestamp': svixTimestamp,
+      'svix-signature': svixSignature,
+    });
+    console.log('Event type received:', event.type);
+  } catch (err) {
+    console.error('Failed to verify Clerk webhook:', err.message);
+    return res.status(400).json({ error: 'Invalid webhook signature or body' });
+  }
+
   const { type, data } = event;
   console.log(`Webhook event type: ${type}`);
 
   try {
     if (type === 'user.created') {
-      // Pull what we need from Clerk's user object
       const userId = data.id;
       const firstName = data.first_name || '';
       const lastName = data.last_name || '';
-      const displayName = `${firstName} ${lastName}`.trim() || 
-                           data.email_addresses[0]?.email_address?.split('@')[0] || 
-                           'User';
+      const primaryEmail = data.email_addresses?.[0]?.email_address || null;
+      const displayName =
+        `${firstName} ${lastName}`.trim() ||
+        primaryEmail?.split('@')[0] ||
+        'User';
       const avatarUrl = data.image_url || null;
 
       console.log(`Creating user in Supabase: ${userId} — ${displayName}`);
@@ -60,6 +64,8 @@ try {
         .insert({
           id: userId,
           display_name: displayName,
+          username: data.username || displayName.toLowerCase().replace(/[^a-z0-9_]/g, '') || userId.slice(0, 12),
+          email: primaryEmail,
           avatar_url: avatarUrl,
         });
 
@@ -88,9 +94,7 @@ try {
       console.log(`✅ User ${userId} deleted from Supabase`);
     }
 
-    // Always return 200 so Clerk knows we received it
     return res.status(200).json({ received: true });
-
   } catch (err) {
     console.error('Webhook handler error:', err.message);
     return res.status(500).json({ error: 'Webhook processing failed' });
@@ -99,6 +103,8 @@ try {
 
 // --------------------------------------------------------
 // POST /api/webhooks/paystack — handle Paystack payment events
+// Handles: subscription.create, charge.success (premium & wallet top-up),
+//          subscription.disable, subscription.not_renew, invoice.payment_failed
 // --------------------------------------------------------
 router.post('/paystack', async (req, res) => {
   console.log('📩 Paystack webhook received');
@@ -106,7 +112,6 @@ router.post('/paystack', async (req, res) => {
   const paystack = require('../services/paystack');
   const signature = req.headers['x-paystack-signature'];
 
-  // Verify HMAC-SHA512 webhook signature
   const isVerified = paystack.verifyWebhookSignature(signature, req.body);
   if (!isVerified) {
     console.warn('⚠️ Invalid Paystack webhook signature');
@@ -130,27 +135,110 @@ router.post('/paystack', async (req, res) => {
   try {
     if (eventType === 'charge.success') {
       const userId = data.metadata?.user_id;
+      const purpose = data.metadata?.purpose;
 
-      if (userId) {
+      if (userId && purpose === 'wallet_topup') {
+        const amountNGN = Math.round(Number(data.amount || 0) / 100);
+        await walletService.creditWallet({
+          userId,
+          amountNGN,
+          reference: data.reference,
+          description: `Paystack wallet top up (₦${amountNGN})`,
+          metadata: { paystack_id: data.id },
+        });
+        console.log(`✅ Wallet topped up for ${userId}: ₦${amountNGN}`);
+      } else if (userId) {
         console.log(`Activating subscription for user: ${userId} via Paystack webhook`);
         const subscriptionStart = new Date(data.paid_at || Date.now());
         const subscriptionEnd = new Date(subscriptionStart);
-        subscriptionEnd.setDate(subscriptionEnd.getDate() + 30);
+        subscriptionEnd.setDate(subscriptionEnd.getDate() + subscriptionConfig.paidSubscriptionDays);
 
         await supabase
           .from('subscriptions')
-          .upsert({
-            user_id: userId,
-            is_premium: true,
-            status: 'active',
-            subscription_start: subscriptionStart.toISOString(),
-            subscription_end: subscriptionEnd.toISOString(),
-            paystack_customer_id: data.customer?.customer_code || null,
-            paystack_subscription_code: data.reference,
-            updated_at: new Date().toISOString(),
-          }, { onConflict: 'user_id' });
+          .upsert(
+            {
+              user_id: userId,
+              is_premium: true,
+              status: 'active',
+              subscription_start: subscriptionStart.toISOString(),
+              subscription_end: subscriptionEnd.toISOString(),
+              grace_period_end: null,
+              paystack_customer_id: data.customer?.customer_code || null,
+              paystack_subscription_code: data.subscription?.subscription_code || data.reference,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' }
+          );
 
         console.log(`✅ Subscription activated for ${userId}`);
+      }
+    }
+
+    if (eventType === 'subscription.create') {
+      const userId = data.metadata?.user_id;
+      const customerCode = data.customer?.customer_code;
+      const subCode = data.subscription_code;
+      const subscriptionStart = new Date();
+      const subscriptionEnd = new Date(subscriptionStart);
+      subscriptionEnd.setDate(subscriptionEnd.getDate() + subscriptionConfig.paidSubscriptionDays);
+
+      if (userId) {
+        await supabase
+          .from('subscriptions')
+          .upsert(
+            {
+              user_id: userId,
+              is_premium: true,
+              status: 'active',
+              subscription_start: subscriptionStart.toISOString(),
+              subscription_end: subscriptionEnd.toISOString(),
+              grace_period_end: null,
+              paystack_customer_id: customerCode || null,
+              paystack_subscription_code: subCode || null,
+              updated_at: new Date().toISOString(),
+            },
+            { onConflict: 'user_id' }
+          );
+      }
+    }
+
+    if (eventType === 'invoice.payment_failed') {
+      const subCode = data.subscription?.subscription_code;
+      const customerCode = data.customer?.customer_code;
+      const graceEnd = new Date();
+      graceEnd.setDate(graceEnd.getDate() + subscriptionConfig.gracePeriodDays);
+
+      if (subCode || customerCode) {
+        let query = supabase
+          .from('subscriptions')
+          .select('user_id');
+
+        query = subCode
+          ? query.eq('paystack_subscription_code', subCode)
+          : query.eq('paystack_customer_id', customerCode);
+
+        const { data: subRow } = await query.maybeSingle();
+
+        if (subRow?.user_id) {
+          await supabase
+            .from('subscriptions')
+            .update({
+              status: 'past_due',
+              is_premium: true,
+              grace_period_end: graceEnd.toISOString(),
+              updated_at: new Date().toISOString(),
+            })
+            .eq('user_id', subRow.user_id);
+
+          await supabase.from('notifications').insert({
+            user_id: subRow.user_id,
+            type: 'subscription_payment_failed',
+            title: 'Premium renewal payment failed',
+            body: `Your renewal failed. You have a ${subscriptionConfig.gracePeriodDays}-day grace period to update your payment method.`,
+            data: { grace_period_end: graceEnd.toISOString() },
+            is_read: false,
+          });
+        }
       }
     }
 

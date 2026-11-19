@@ -20,7 +20,16 @@ app.use('/api/webhooks', express.raw({ type: 'application/json' }));
 // Parse JSON for all other routes
 app.use(express.json());
 
-// --- Health check ---
+// --- Root & Health check ---
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ok',
+    service: 'Sweeger backend',
+    health: '/health',
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -41,6 +50,11 @@ app.use('/api/subscriptions', require('./routes/subscriptions'));
 app.use('/api/watchmate', require('./routes/watchmate'));
 app.use('/api/categories', require('./routes/categories'));
 app.use('/api/notifications', require('./routes/notifications').router);
+app.use('/api/profile', require('./routes/profile'));
+app.use('/api/users', require('./routes/users'));
+app.use('/api/wallet', require('./routes/wallet'));
+app.use('/api/cinema', require('./routes/cinema'));
+app.use('/api/admin', require('./routes/admin'));
 
 // --- 404 handler ---
 app.use((req, res) => {
@@ -55,11 +69,11 @@ app.use((err, req, res, next) => {
   });
 });
 
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 if (require.main === module) {
   const { startRoomCleaner } = require('./services/roomCleaner');
-  app.listen(PORT, () => {
-    console.log(`🚀 Sweeger backend running on port ${PORT}`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Sweeger backend running on http://0.0.0.0:${PORT}`);
     startRoomCleaner(30000);
   });
 }

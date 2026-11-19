@@ -17,6 +17,12 @@ const isSubscriptionActive = (subscriptionEnd) => {
   return new Date() < new Date(subscriptionEnd);
 };
 
+// Helper — check if failed renewal grace period is still active
+const isInGracePeriod = (graceEnd) => {
+  if (!graceEnd) return false;
+  return new Date() < new Date(graceEnd);
+};
+
 // Helper — calculate remaining days for urgency / customer psychology
 const getDaysRemaining = (endDate) => {
   if (!endDate) return 0;
@@ -24,17 +30,37 @@ const getDaysRemaining = (endDate) => {
   return Math.max(0, Math.ceil(msRemaining / (1000 * 60 * 60 * 24)));
 };
 
+/**
+ * Single source of truth for Premium status across Live, Cinema, Poddy, and Wallet.
+ */
+async function isUserPremium(userId) {
+  if (!userId) return false;
+  const { data: sub } = await supabase
+    .from('subscriptions')
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (!sub) return false;
+  if (sub.status === 'trial') return isTrialActive(sub.trial_end);
+  if (sub.status === 'active') return isSubscriptionActive(sub.subscription_end);
+  if (sub.status === 'past_due') return isInGracePeriod(sub.grace_period_end);
+  return Boolean(sub.is_premium);
+}
+
 // --------------------------------------------------------
 // GET /api/subscriptions/config
 // Returns current pricing & trial configuration for the frontend
-// Easily allows the frontend to show "Start your X-day free trial"
 // --------------------------------------------------------
 router.get('/config', (req, res) => {
   return res.status(200).json({
     free_trial_days: subscriptionConfig.freeTrialDays,
+    first_month_free: subscriptionConfig.freeTrialDays >= 30,
     monthly_price: subscriptionConfig.monthlyPriceNGN,
     currency: subscriptionConfig.currency,
+    grace_period_days: subscriptionConfig.gracePeriodDays,
     paystack_plan_code: subscriptionConfig.paystackPlanCode,
+    popup_copy: `Subscribe ₦${subscriptionConfig.monthlyPriceNGN} to join this league`,
   });
 });
 
@@ -59,7 +85,7 @@ router.post('/start-trial', requireAuth, async (req, res) => {
     }
 
     if (existing) {
-      return res.status(400).json({ 
+      return res.status(400).json({
         error: 'Trial already started',
         status: existing.status,
         trial_end: existing.trial_end,
@@ -68,7 +94,6 @@ router.post('/start-trial', requireAuth, async (req, res) => {
 
     const trialStart = new Date();
     const trialEnd = new Date();
-    // Use configurable free trial days (default 7 days)
     trialEnd.setDate(trialEnd.getDate() + subscriptionConfig.freeTrialDays);
 
     const { error: insertError } = await supabase
@@ -88,11 +113,11 @@ router.post('/start-trial', requireAuth, async (req, res) => {
 
     return res.status(201).json({
       message: `Your ${subscriptionConfig.freeTrialDays}-day free trial has started! Enjoy full premium access.`,
+      is_premium: true,
       trial_days: subscriptionConfig.freeTrialDays,
       trial_start: trialStart.toISOString(),
       trial_end: trialEnd.toISOString(),
     });
-
   } catch (err) {
     console.error('Start trial error:', err.message);
     return res.status(500).json({ error: 'Failed to start trial' });
@@ -101,7 +126,7 @@ router.post('/start-trial', requireAuth, async (req, res) => {
 
 // --------------------------------------------------------
 // GET /api/subscriptions/status
-// Get current user subscription status with countdown and psychology badges
+// Get current user subscription status with countdown and grace-period handling
 // --------------------------------------------------------
 router.get('/status', requireAuth, async (req, res) => {
   try {
@@ -122,12 +147,17 @@ router.get('/status', requireAuth, async (req, res) => {
       return res.status(200).json({
         is_premium: false,
         status: 'none',
+        plan: 'Free',
         message: `No active subscription. Start your ${subscriptionConfig.freeTrialDays}-day free trial today!`,
         trial_duration_days: subscriptionConfig.freeTrialDays,
+        pricing: {
+          amount: subscriptionConfig.monthlyPriceNGN,
+          currency: subscriptionConfig.currency,
+        },
       });
     }
 
-    // Check if trial has expired and update status
+    // Check if trial has expired
     if (sub.status === 'trial') {
       if (!isTrialActive(sub.trial_end)) {
         await supabase
@@ -142,6 +172,7 @@ router.get('/status', requireAuth, async (req, res) => {
         return res.status(200).json({
           is_premium: false,
           status: 'expired',
+          plan: 'Free',
           is_trial: true,
           days_remaining: 0,
           message: 'Your free trial has ended. Subscribe now to keep enjoying unlimited rooms and premium features.',
@@ -153,22 +184,54 @@ router.get('/status', requireAuth, async (req, res) => {
         });
       }
 
-      // Active trial
       const daysLeft = getDaysRemaining(sub.trial_end);
       return res.status(200).json({
         is_premium: true,
         status: 'trial',
+        plan: 'Premium Active',
         is_trial: true,
         days_remaining: daysLeft,
-        message: daysLeft === 1 
-          ? 'Final day of your free trial! Upgrade now so you do not lose access.' 
-          : `${daysLeft} days remaining in your free trial.`,
+        message:
+          daysLeft === 1
+            ? 'Final day of your free trial! Upgrade now so you do not lose access.'
+            : `${daysLeft} days remaining in your free trial.`,
         trial_start: sub.trial_start,
         trial_end: sub.trial_end,
         pricing: {
           amount: subscriptionConfig.monthlyPriceNGN,
           currency: subscriptionConfig.currency,
         },
+      });
+    }
+
+    // Check failed-renewal grace period
+    if (sub.status === 'past_due') {
+      if (isInGracePeriod(sub.grace_period_end)) {
+        return res.status(200).json({
+          is_premium: true,
+          status: 'past_due',
+          plan: 'Premium Active',
+          in_grace_period: true,
+          grace_period_end: sub.grace_period_end,
+          days_remaining: getDaysRemaining(sub.grace_period_end),
+          message: 'Renewal payment failed. You are in a grace period — please update your card to keep Premium.',
+        });
+      }
+      await supabase
+        .from('subscriptions')
+        .update({
+          is_premium: false,
+          status: 'expired',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('user_id', userId);
+
+      return res.status(200).json({
+        is_premium: false,
+        status: 'expired',
+        plan: 'Free',
+        days_remaining: 0,
+        message: 'Grace period ended. Renew your plan to restore Premium access.',
       });
     }
 
@@ -187,6 +250,7 @@ router.get('/status', requireAuth, async (req, res) => {
         return res.status(200).json({
           is_premium: false,
           status: 'expired',
+          plan: 'Free',
           is_trial: false,
           days_remaining: 0,
           message: 'Your subscription has expired. Renew your plan to continue with premium features.',
@@ -201,6 +265,7 @@ router.get('/status', requireAuth, async (req, res) => {
       return res.status(200).json({
         is_premium: true,
         status: 'active',
+        plan: 'Premium Active',
         is_trial: false,
         days_remaining: daysLeft,
         subscription_start: sub.subscription_start,
@@ -208,17 +273,16 @@ router.get('/status', requireAuth, async (req, res) => {
       });
     }
 
-    // Any other status (cancelled, paused, etc.)
     return res.status(200).json({
-      is_premium: sub.is_premium,
+      is_premium: Boolean(sub.is_premium),
       status: sub.status,
+      plan: sub.is_premium ? 'Premium Active' : 'Free',
       is_trial: false,
       trial_start: sub.trial_start,
       trial_end: sub.trial_end,
       subscription_start: sub.subscription_start,
       subscription_end: sub.subscription_end,
     });
-
   } catch (err) {
     console.error('Subscription status error:', err.message);
     return res.status(500).json({ error: 'Failed to fetch subscription status' });
@@ -235,14 +299,13 @@ router.post('/initialize', requireAuth, async (req, res) => {
     let { email, callback_url, amount } = req.body || {};
 
     if (!email) {
-      // Look up user display name / fallback
       const { data: userRecord } = await supabase
         .from('users')
-        .select('id, display_name')
+        .select('id, email, display_name')
         .eq('id', userId)
         .maybeSingle();
 
-      email = `${userId}@sweeger.buzz`;
+      email = userRecord?.email || `${userId}@sweeger.buzz`;
     }
 
     const checkoutData = await paystack.initializePayment({
@@ -250,6 +313,7 @@ router.post('/initialize', requireAuth, async (req, res) => {
       amount: amount || subscriptionConfig.monthlyPriceNGN,
       userId,
       callbackUrl: callback_url,
+      metadata: { purpose: 'premium_subscription' },
     });
 
     return res.status(200).json({
@@ -258,33 +322,29 @@ router.post('/initialize', requireAuth, async (req, res) => {
       amount: amount || subscriptionConfig.monthlyPriceNGN,
       currency: subscriptionConfig.currency,
     });
-
   } catch (err) {
     console.error('Initialize payment error:', err.message);
-    return res.status(err instanceof paystack.PaystackError ? err.status : 500)
+    return res
+      .status(err instanceof paystack.PaystackError ? err.status : 500)
       .json({ error: err.message || 'Failed to initialize payment' });
   }
 });
 
-// --------------------------------------------------------
-// POST /api/subscriptions/verify
-// Verify Paystack payment reference and activate premium subscription
-// --------------------------------------------------------
-router.post('/verify', requireAuth, async (req, res) => {
+// Shared verification handler for POST /verify and GET /verify/:reference
+async function handleVerify(req, res) {
   try {
     const userId = req.auth.userId;
-    const { reference } = req.body || {};
+    const reference = req.body?.reference || req.params?.reference;
 
     if (!reference) {
       return res.status(400).json({ error: 'Payment reference is required' });
     }
 
-    // Verify transaction with Paystack
     const transaction = await paystack.verifyTransaction(reference);
 
     if (transaction.status !== 'success') {
-      return res.status(400).json({ 
-        error: `Payment verification failed. Paystack status: ${transaction.status}` 
+      return res.status(400).json({
+        error: `Payment verification failed. Paystack status: ${transaction.status}`,
       });
     }
 
@@ -294,16 +354,20 @@ router.post('/verify', requireAuth, async (req, res) => {
 
     const { error: upsertError } = await supabase
       .from('subscriptions')
-      .upsert({
-        user_id: userId,
-        is_premium: true,
-        status: 'active',
-        subscription_start: subscriptionStart.toISOString(),
-        subscription_end: subscriptionEnd.toISOString(),
-        paystack_customer_id: transaction.customer?.customer_code || null,
-        paystack_subscription_code: transaction.subscription?.subscription_code || reference,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id' });
+      .upsert(
+        {
+          user_id: userId,
+          is_premium: true,
+          status: 'active',
+          subscription_start: subscriptionStart.toISOString(),
+          subscription_end: subscriptionEnd.toISOString(),
+          grace_period_end: null,
+          paystack_customer_id: transaction.customer?.customer_code || null,
+          paystack_subscription_code: transaction.subscription?.subscription_code || reference,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
 
     if (upsertError) {
       console.error('Supabase activate subscription error:', upsertError.message);
@@ -314,38 +378,30 @@ router.post('/verify', requireAuth, async (req, res) => {
       message: 'Payment verified and subscription activated successfully! Welcome to Sweeger Premium.',
       is_premium: true,
       status: 'active',
+      plan: 'Premium Active',
       subscription_start: subscriptionStart.toISOString(),
       subscription_end: subscriptionEnd.toISOString(),
       reference,
     });
-
   } catch (err) {
     console.error('Verify payment error:', err.message);
-    return res.status(err instanceof paystack.PaystackError ? err.status : 500)
+    return res
+      .status(err instanceof paystack.PaystackError ? err.status : 500)
       .json({ error: err.message || 'Failed to verify payment' });
   }
-});
+}
 
-// --------------------------------------------------------
-// GET /api/subscriptions/verify/:reference
-// Convenient GET endpoint for frontend redirection verification
-// --------------------------------------------------------
-router.get('/verify/:reference', requireAuth, async (req, res) => {
-  req.body = { reference: req.params.reference };
-  // Forward to verification logic
-  return router.handle({ ...req, method: 'POST', url: '/verify' }, res);
-});
+router.post('/verify', requireAuth, handleVerify);
+router.get('/verify/:reference', requireAuth, handleVerify);
 
 // --------------------------------------------------------
 // POST /api/subscriptions/activate — called after Paystack payment
-// Supports both direct reference verification and legacy payloads
 // --------------------------------------------------------
 router.post('/activate', requireAuth, async (req, res) => {
   try {
     const userId = req.auth.userId;
     const { reference, paystack_customer_id, paystack_subscription_code } = req.body || {};
 
-    // If reference provided, verify with Paystack first
     if (reference) {
       const transaction = await paystack.verifyTransaction(reference);
       if (transaction.status !== 'success') {
@@ -359,16 +415,20 @@ router.post('/activate', requireAuth, async (req, res) => {
 
     const { error: upsertError } = await supabase
       .from('subscriptions')
-      .upsert({
-        user_id: userId,
-        is_premium: true,
-        status: 'active',
-        subscription_start: subscriptionStart.toISOString(),
-        subscription_end: subscriptionEnd.toISOString(),
-        paystack_customer_id: paystack_customer_id || null,
-        paystack_subscription_code: paystack_subscription_code || reference || null,
-        updated_at: new Date().toISOString(),
-      }, { onConflict: 'user_id' });
+      .upsert(
+        {
+          user_id: userId,
+          is_premium: true,
+          status: 'active',
+          subscription_start: subscriptionStart.toISOString(),
+          subscription_end: subscriptionEnd.toISOString(),
+          grace_period_end: null,
+          paystack_customer_id: paystack_customer_id || null,
+          paystack_subscription_code: paystack_subscription_code || reference || null,
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: 'user_id' }
+      );
 
     if (upsertError) {
       console.error('Activate subscription error:', upsertError.message);
@@ -379,12 +439,14 @@ router.post('/activate', requireAuth, async (req, res) => {
       message: 'Subscription activated successfully',
       is_premium: true,
       status: 'active',
+      plan: 'Premium Active',
       subscription_end: subscriptionEnd.toISOString(),
     });
-
   } catch (err) {
     console.error('Activate subscription error:', err.message);
-    return res.status(500).json({ error: 'Failed to activate subscription' });
+    return res
+      .status(err instanceof paystack.PaystackError ? err.status : 500)
+      .json({ error: err.message || 'Failed to activate subscription' });
   }
 });
 
@@ -401,7 +463,6 @@ router.post('/cancel', requireAuth, async (req, res) => {
       .eq('user_id', userId)
       .maybeSingle();
 
-    // If subscription code exists, disable recurring on Paystack
     if (sub?.paystack_subscription_code) {
       await paystack.disableSubscription(sub.paystack_subscription_code).catch(() => null);
     }
@@ -420,8 +481,12 @@ router.post('/cancel', requireAuth, async (req, res) => {
       return res.status(500).json({ error: 'Failed to cancel subscription' });
     }
 
-    return res.status(200).json({ message: 'Subscription cancelled successfully' });
-
+    return res.status(200).json({
+      message: 'Subscription cancelled successfully',
+      is_premium: false,
+      status: 'cancelled',
+      plan: 'Free',
+    });
   } catch (err) {
     console.error('Cancel subscription error:', err.message);
     return res.status(500).json({ error: 'Failed to cancel subscription' });
@@ -429,3 +494,4 @@ router.post('/cancel', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.isUserPremium = isUserPremium;

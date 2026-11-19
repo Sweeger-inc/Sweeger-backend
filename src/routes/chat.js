@@ -2,16 +2,19 @@ const express = require('express');
 const router = express.Router({ mergeParams: true });
 const supabase = require('../services/supabase');
 const { requireAuth, optionalAuth } = require('../middleware/auth');
+const realtime = require('../services/realtime');
+
+const ALLOWED_LAYERS = ['general', 'poddy', 'watchmate', 'private_group'];
 
 // --------------------------------------------------------
 // GET /api/rooms/:roomId/chat
-// Get chat messages for a room
+// Get chat messages for a room (optionally filtered by layer)
 // --------------------------------------------------------
 router.get('/', optionalAuth, async (req, res) => {
   try {
     const { roomId } = req.params;
+    const { layer } = req.query;
 
-    // Check room exists
     const { data: room, error: roomError } = await supabase
       .from('rooms')
       .select('id, is_public, invite_token')
@@ -22,11 +25,16 @@ router.get('/', optionalAuth, async (req, res) => {
       return res.status(404).json({ error: 'Room not found' });
     }
 
-    // Fetch last 100 messages
-    const { data: messages, error } = await supabase
+    let query = supabase
       .from('chat_messages')
       .select('*')
-      .eq('room_id', roomId)
+      .eq('room_id', roomId);
+
+    if (layer && ALLOWED_LAYERS.includes(layer)) {
+      query = query.eq('layer', layer);
+    }
+
+    const { data: messages, error } = await query
       .order('created_at', { ascending: true })
       .limit(100);
 
@@ -37,10 +45,10 @@ router.get('/', optionalAuth, async (req, res) => {
 
     return res.status(200).json({
       room_id: roomId,
+      layer: layer || 'all',
       count: messages.length,
       messages,
     });
-
   } catch (err) {
     console.error('Get chat error:', err.message);
     return res.status(500).json({ error: 'Server error' });
@@ -49,34 +57,33 @@ router.get('/', optionalAuth, async (req, res) => {
 
 // --------------------------------------------------------
 // POST /api/rooms/:roomId/chat
-// Send a chat message
+// Send a chat message or quick reaction (broadcasts over SSE)
 // --------------------------------------------------------
 router.post('/', optionalAuth, async (req, res) => {
   try {
     const { roomId } = req.params;
-    const { content, type, guest_name } = req.body || {};
+    const { content, type, guest_name, layer } = req.body || {};
     const userId = req.auth?.userId || null;
 
-    // Validate content
     if (!content || content.trim().length === 0) {
       return res.status(400).json({ error: 'Message content is required' });
     }
 
     if (content.trim().length > 500) {
-      return res.status(400).json({ 
-        error: 'Message too long. Maximum 500 characters.' 
+      return res.status(400).json({
+        error: 'Message too long. Maximum 500 characters.',
       });
     }
 
-    // Validate type
     const messageType = type || 'message';
     if (!['message', 'reaction'].includes(messageType)) {
-      return res.status(400).json({ 
-        error: 'Invalid message type. Must be message or reaction.' 
+      return res.status(400).json({
+        error: 'Invalid message type. Must be message or reaction.',
       });
     }
 
-    // Check room exists and is active
+    const msgLayer = ALLOWED_LAYERS.includes(layer) ? layer : 'general';
+
     const { data: room, error: roomError } = await supabase
       .from('rooms')
       .select('id, status')
@@ -91,7 +98,6 @@ router.post('/', optionalAuth, async (req, res) => {
       return res.status(410).json({ error: 'This room has ended' });
     }
 
-    // Get sender name
     let senderName = guest_name || 'Guest';
     if (userId) {
       const { data: user } = await supabase
@@ -103,7 +109,7 @@ router.post('/', optionalAuth, async (req, res) => {
     }
 
     // Rate limiting — check last message time
-    if (userId) {
+    if (userId && messageType === 'message') {
       const oneSecondAgo = new Date(Date.now() - 1000).toISOString();
       const { count } = await supabase
         .from('chat_messages')
@@ -113,14 +119,13 @@ router.post('/', optionalAuth, async (req, res) => {
         .gte('created_at', oneSecondAgo);
 
       if (count > 0) {
-        return res.status(429).json({ 
+        return res.status(429).json({
           error: 'slow_down',
-          message: 'You are sending messages too fast. Slow down!' 
+          message: 'You are sending messages too fast. Slow down!',
         });
       }
     }
 
-    // Save message
     const { data: message, error: messageError } = await supabase
       .from('chat_messages')
       .insert({
@@ -129,6 +134,7 @@ router.post('/', optionalAuth, async (req, res) => {
         sender_name: senderName,
         content: content.trim(),
         type: messageType,
+        layer: msgLayer,
       })
       .select()
       .single();
@@ -138,10 +144,14 @@ router.post('/', optionalAuth, async (req, res) => {
       return res.status(500).json({ error: 'Failed to send message' });
     }
 
-    console.log(`💬 Message sent in room ${roomId} by ${senderName}`);
+    realtime.publish(
+      'room',
+      roomId,
+      messageType === 'reaction' ? 'reaction' : 'chat_message',
+      { message }
+    );
 
     return res.status(201).json({ message });
-
   } catch (err) {
     console.error('Send message error:', err.message);
     return res.status(500).json({ error: 'Server error' });
@@ -157,7 +167,6 @@ router.delete('/:messageId', requireAuth, async (req, res) => {
     const { roomId, messageId } = req.params;
     const { userId } = req.auth;
 
-    // Get the message
     const { data: message, error: messageError } = await supabase
       .from('chat_messages')
       .select('*')
@@ -169,7 +178,6 @@ router.delete('/:messageId', requireAuth, async (req, res) => {
       return res.status(404).json({ error: 'Message not found' });
     }
 
-    // Check if user is sender or host
     const { data: room } = await supabase
       .from('rooms')
       .select('host_id')
@@ -180,8 +188,8 @@ router.delete('/:messageId', requireAuth, async (req, res) => {
     const isHost = room?.host_id === userId;
 
     if (!isSender && !isHost) {
-      return res.status(403).json({ 
-        error: 'Only the sender or host can delete this message' 
+      return res.status(403).json({
+        error: 'Only the sender or host can delete this message',
       });
     }
 
@@ -193,7 +201,6 @@ router.delete('/:messageId', requireAuth, async (req, res) => {
     console.log(`🗑️ Message ${messageId} deleted in room ${roomId}`);
 
     return res.status(200).json({ message: 'Message deleted successfully' });
-
   } catch (err) {
     console.error('Delete message error:', err.message);
     return res.status(500).json({ error: 'Server error' });

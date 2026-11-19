@@ -3,14 +3,23 @@ const router = express.Router();
 const supabase = require('../services/supabase');
 const { requireAuth } = require('../middleware/auth');
 
-// Available categories
+// PRD v7 onboarding interests
+const ONBOARDING_INTERESTS = [
+  'Football',
+  'Afrobeats',
+  'Nollywood',
+  'Gaming',
+  'Creators',
+  'News',
+];
+
+// Full supported category list (PRD v7 interests + existing categories for backwards compatibility)
 const AVAILABLE_CATEGORIES = [
+  ...ONBOARDING_INTERESTS,
   'Sports',
   'Music',
-  'Gaming',
   'Movies',
   'Comedy',
-  'News',
   'Technology',
   'Fashion',
   'Food',
@@ -19,9 +28,12 @@ const AVAILABLE_CATEGORIES = [
   'Lifestyle',
 ];
 
-// GET /api/categories — get all available categories
+// GET /api/categories — get all available categories & onboarding interests
 router.get('/', async (req, res) => {
-  return res.status(200).json({ categories: AVAILABLE_CATEGORIES });
+  return res.status(200).json({
+    interests: ONBOARDING_INTERESTS,
+    categories: AVAILABLE_CATEGORIES,
+  });
 });
 
 // GET /api/categories/mine — get current user's selected categories
@@ -38,16 +50,15 @@ router.get('/mine', requireAuth, async (req, res) => {
 
     return res.status(200).json({
       count: data.length,
-      categories: data.map(d => d.category),
+      categories: data.map((d) => d.category),
     });
-
   } catch (err) {
     console.error('Get categories error:', err.message);
     return res.status(500).json({ error: 'Failed to fetch categories' });
   }
 });
 
-// POST /api/categories — save user's selected categories (max 2)
+// POST /api/categories — save user's selected categories (must pick exactly 2)
 router.post('/', requireAuth, async (req, res) => {
   try {
     const userId = req.auth.userId;
@@ -57,12 +68,13 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Categories must be an array' });
     }
 
-    if (categories.length !== 2) {
+    const unique = [...new Set(categories)];
+    if (unique.length !== 2) {
       return res.status(400).json({ error: 'You must select exactly 2 categories' });
     }
 
     // Validate categories are from the allowed list
-    const invalid = categories.filter(c => !AVAILABLE_CATEGORIES.includes(c));
+    const invalid = unique.filter((c) => !AVAILABLE_CATEGORIES.includes(c));
     if (invalid.length > 0) {
       return res.status(400).json({ error: `Invalid categories: ${invalid.join(', ')}` });
     }
@@ -74,15 +86,22 @@ router.post('/', requireAuth, async (req, res) => {
       .eq('user_id', userId);
 
     // Insert new ones
-    await supabase
+    const { error: insertError } = await supabase
       .from('user_categories')
-      .insert(categories.map(category => ({ user_id: userId, category })));
+      .insert(unique.map((category) => ({ user_id: userId, category })));
+
+    if (insertError) throw insertError;
+
+    // Also mirror onto users.interests if user row exists
+    await supabase
+      .from('users')
+      .update({ interests: unique })
+      .eq('id', userId);
 
     return res.status(200).json({
       message: 'Categories saved successfully',
-      categories,
+      categories: unique,
     });
-
   } catch (err) {
     console.error('Save categories error:', err.message);
     return res.status(500).json({ error: 'Failed to save categories' });
@@ -100,7 +119,6 @@ router.delete('/', requireAuth, async (req, res) => {
       .eq('user_id', userId);
 
     return res.status(200).json({ message: 'Categories cleared' });
-
   } catch (err) {
     console.error('Clear categories error:', err.message);
     return res.status(500).json({ error: 'Failed to clear categories' });
@@ -108,3 +126,5 @@ router.delete('/', requireAuth, async (req, res) => {
 });
 
 module.exports = router;
+module.exports.ONBOARDING_INTERESTS = ONBOARDING_INTERESTS;
+module.exports.AVAILABLE_CATEGORIES = AVAILABLE_CATEGORIES;

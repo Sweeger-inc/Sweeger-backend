@@ -17,9 +17,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test tests/rooms_and_cleaner.test.js",
+    "lint": "node -e \"const fs=require('fs'),cp=require('child_process'),p=require('path');(function w(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){const f=p.join(d,e.name);if(e.isDirectory())w(f);else if(f.endsWith('.js'))cp.execFileSync(process.execPath,['--check',f],{stdio:'inherit'})}})('src')\"",
+    "build": "node --check src/app.js",
     "start": "node src/app.js",
-    "dev": "nodemon src/app.js"
+    "dev": "node src/app.js"
   },
   "keywords": [],
   "author": "",
